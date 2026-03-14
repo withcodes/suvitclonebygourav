@@ -1,119 +1,185 @@
 import { UploadCloud, FileText, CheckCircle, AlertTriangle, Loader2 } from 'lucide-react';
 import { useState, useRef } from 'react';
 import type { ReconciledItem, SummaryStats } from '../App';
+import { toast } from './Toast';
 
 interface FileUploadAreaProps {
+  mode: 'gstr1' | 'gstr2b';
   onReconciliationComplete: (data: ReconciledItem[], summary: SummaryStats) => void;
 }
 
-export default function FileUploadArea({ onReconciliationComplete }: FileUploadAreaProps) {
-  const [prFile, setPrFile] = useState<File | null>(null);
-  const [gstrFile, setGstrFile] = useState<File | null>(null);
+const CONFIG = {
+  gstr2b: {
+    icon: '📦',
+    file1: { key: 'prFile',    label: 'Purchase Register (Tally)',  accent: '#6366f1' },
+    file2: { key: 'gstr2bFile',label: 'GSTR-2B (Portal)',           accent: '#0891b2' },
+    endpoint: '/api/reconcile',
+    title: 'GSTR-2B Reconciliation Engine',
+    desc:  'Upload Tally Purchase Register and GSTR-2B Excel files to run smart reconciliation.',
+  },
+  gstr1: {
+    icon: '📤',
+    file1: { key: 'salesFile', label: 'Sales Register (Tally)',     accent: '#7c3aed' },
+    file2: { key: 'gstr1File', label: 'GSTR-1 (Portal)',            accent: '#0d9488' },
+    endpoint: '/api/reconcile/gstr1',
+    title: 'GSTR-1 Reconciliation Engine',
+    desc:  'Upload Tally Sales Register and GSTR-1 Excel files to identify missing invoices.',
+  },
+} as const;
+
+export default function FileUploadArea({ mode, onReconciliationComplete }: FileUploadAreaProps) {
+  const cfg = CONFIG[mode];
+  const [file1, setFile1]         = useState<File | null>(null);
+  const [file2, setFile2]         = useState<File | null>(null);
   const [isUploading, setIsUploading] = useState(false);
-  
-  const prInputRef = useRef<HTMLInputElement>(null);
-  const gstrInputRef = useRef<HTMLInputElement>(null);
+  const ref1 = useRef<HTMLInputElement>(null);
+  const ref2 = useRef<HTMLInputElement>(null);
 
   const handleProcess = async () => {
-    if (!prFile || !gstrFile) {
-        alert("Please upload both Purchase Register and GSTR-2B files.");
-        return;
+    if (!file1 || !file2) {
+      toast.warning('Please upload both files before running reconciliation.');
+      return;
     }
-
     setIsUploading(true);
-
-    const formData = new FormData();
-    formData.append('prFile', prFile);
-    formData.append('gstr2bFile', gstrFile);
-
+    const fd = new FormData();
+    fd.append(cfg.file1.key, file1);
+    fd.append(cfg.file2.key, file2);
     try {
-        const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-        const response = await fetch(`${apiUrl}/api/reconcile`, {
-            method: 'POST',
-            body: formData,
-        });
-
-        if (!response.ok) {
-            throw new Error('Failed to process. Make sure the files are valid Excel format.');
-        }
-
-        const result = await response.json();
-        onReconciliationComplete(result.data, result.summary);
-        
-    } catch (error: any) {
-        alert(error.message);
+      const apiUrl = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+      const res = await fetch(`${apiUrl}${cfg.endpoint}`, { method: 'POST', body: fd });
+      if (!res.ok) throw new Error(await res.text());
+      const result = await res.json();
+      onReconciliationComplete(result.data, result.summary);
+      toast.success(`✅ Reconciliation complete — ${result.data?.length ?? 0} invoices processed`);
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to process files. Ensure Excel format is correct.');
     } finally {
-        setIsUploading(false);
+      setIsUploading(false);
     }
   };
 
+  const FileZone = ({
+    file, setFile, refEl, label, accent,
+  }: {
+    file: File | null;
+    setFile: (f: File) => void;
+    refEl: React.RefObject<HTMLInputElement | null>;
+    label: string;
+    accent: string;
+  }) => (
+    <div
+      className="rounded-2xl p-6 flex flex-col items-center justify-center text-center cursor-pointer transition-all"
+      style={{
+        border: `2px dashed ${file ? accent : 'var(--border-subtle)'}`,
+        background: file ? `${accent}0a` : 'var(--bg-surface-2)',
+        minHeight: 150,
+      }}
+      onClick={() => refEl.current?.click()}
+      onDragOver={e => { e.preventDefault(); }}
+      onDrop={e => {
+        e.preventDefault();
+        const f = e.dataTransfer.files[0];
+        if (f) setFile(f);
+      }}
+    >
+      <input
+        type="file"
+        ref={refEl}
+        className="hidden"
+        accept=".xlsx,.xls,.csv"
+        onChange={e => e.target.files?.[0] && setFile(e.target.files[0])}
+      />
+      <div
+        className="p-3 rounded-full mb-3"
+        style={{ background: `${accent}18` }}
+      >
+        {file
+          ? <CheckCircle size={26} style={{ color: '#10b981' }} />
+          : <FileText size={26} style={{ color: accent }} />}
+      </div>
+      <h4 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+        {file ? file.name : label}
+      </h4>
+      {!file && (
+        <p className="text-xs mt-2" style={{ color: 'var(--text-muted)' }}>
+          Drop file here or click to browse
+        </p>
+      )}
+      {file && (
+        <p className="text-xs mt-1" style={{ color: '#10b981' }}>
+          ✅ {(file.size / 1024).toFixed(1)} KB · Click to change
+        </p>
+      )}
+    </div>
+  );
+
   return (
-    <div className="glass rounded-2xl p-8 transition-all relative overflow-hidden">
-      <div className="absolute top-0 right-0 p-4 opacity-50">
-        <UploadCloud size={100} className="text-primary-100" />
-      </div>
-      
-      <h2 className="text-xl font-semibold mb-2">Automated Reconciliation Engine</h2>
-      <p className="text-slate-500 mb-6 max-w-lg">
-        Upload your Tally Purchase Register and GST Portal GSTR-2B Excel files here. 
-        Our engine will match them instantly using exact and fuzzy logic.
-      </p>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {/* PR File Upload */}
-          <div className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center transition-all ${prFile ? 'border-primary-500 bg-primary-50' : 'border-slate-300 hover:border-primary-400'}`}>
-            <input type="file" ref={prInputRef} className="hidden" accept=".xlsx,.xls,.csv" onChange={(e) => e.target.files && setPrFile(e.target.files[0])} />
-            <div className="bg-primary-50 p-3 rounded-full text-primary-600 mb-3">
-               {prFile ? <CheckCircle size={28} className="text-green-500" /> : <FileText size={28} />}
-            </div>
-            <h3 className="font-medium text-slate-700 text-center">{prFile ? prFile.name : 'Upload Purchase Register (PR)'}</h3>
-            {!prFile && (
-                <button onClick={() => prInputRef.current?.click()} className="mt-4 bg-white border border-slate-200 hover:border-primary-300 hover:bg-primary-50 text-slate-700 font-medium text-sm px-4 py-2 rounded-lg transition-colors">
-                    Browse PR File
-                </button>
-            )}
-          </div>
-
-          {/* GSTR File Upload */}
-          <div className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center transition-all ${gstrFile ? 'border-amber-500 bg-amber-50' : 'border-slate-300 hover:border-amber-400'}`}>
-            <input type="file" ref={gstrInputRef} className="hidden" accept=".xlsx,.xls,.csv" onChange={(e) => e.target.files && setGstrFile(e.target.files[0])} />
-            <div className="bg-amber-50 p-3 rounded-full text-amber-600 mb-3">
-               {gstrFile ? <CheckCircle size={28} className="text-green-500" /> : <FileText size={28} />}
-            </div>
-            <h3 className="font-medium text-slate-700 text-center">{gstrFile ? gstrFile.name : 'Upload GSTR-2B (Portal)'}</h3>
-            {!gstrFile && (
-                <button onClick={() => gstrInputRef.current?.click()} className="mt-4 bg-white border border-slate-200 hover:border-amber-300 hover:bg-amber-50 text-slate-700 font-medium text-sm px-4 py-2 rounded-lg transition-colors">
-                    Browse 2B File
-                </button>
-            )}
-          </div>
+    <div
+      className="glass-card p-7 relative overflow-hidden"
+    >
+      {/* bg icon */}
+      <div style={{ position: 'absolute', top: 10, right: 16, opacity: 0.06, fontSize: 90 }}>
+        <UploadCloud />
       </div>
 
-      <div className="mt-8 flex justify-end gap-4">
-        {prFile && gstrFile && (
-           <button 
-             onClick={handleProcess} 
-             disabled={isUploading}
-             className="bg-primary-600 hover:bg-primary-700 text-white px-8 py-3 rounded-xl font-medium shadow-lg shadow-primary-500/30 transition-all flex items-center gap-2 transform hover:-translate-y-0.5 disabled:opacity-70 disabled:hover:translate-y-0"
-           >
-             {isUploading ? <><Loader2 className="animate-spin" size={20} /> Processing Files...</> : 'Run Live Reconciliation ✨'}
-           </button>
+      <div className="mb-5">
+        <h2 className="text-lg font-bold" style={{ color: 'var(--text-primary)' }}>
+          {cfg.title}
+        </h2>
+        <p className="text-sm mt-1" style={{ color: 'var(--text-muted)', maxWidth: 500 }}>
+          {cfg.desc}
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5 mb-6">
+        <FileZone file={file1} setFile={setFile1} refEl={ref1} label={cfg.file1.label} accent={cfg.file1.accent} />
+        <FileZone file={file2} setFile={setFile2} refEl={ref2} label={cfg.file2.label} accent={cfg.file2.accent} />
+      </div>
+
+      {/* Run button */}
+      <div className="flex justify-end">
+        {file1 && file2 && (
+          <button
+            onClick={handleProcess}
+            disabled={isUploading}
+            className="btn-primary"
+            style={{ paddingLeft: 28, paddingRight: 28, paddingTop: 12, paddingBottom: 12 }}
+          >
+            {isUploading
+              ? <><Loader2 size={17} className="animate-spin" /> Processing…</>
+              : <>⚡ Run {mode === 'gstr2b' ? 'GSTR-2B' : 'GSTR-1'} Reconciliation</>}
+          </button>
         )}
       </div>
 
-      <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-        <div className="bg-white/50 border border-slate-100 p-4 rounded-lg flex items-start gap-3">
-          <CheckCircle className="text-green-500 mt-1 flex-shrink-0" size={20} />
+      {/* Info strip */}
+      <div className="grid grid-cols-2 gap-4 mt-5">
+        <div
+          className="p-3 rounded-xl flex items-start gap-3"
+          style={{ background: 'var(--bg-hover)', border: '1px solid var(--border-subtle)' }}
+        >
+          <CheckCircle size={16} style={{ color: '#10b981', flexShrink: 0, marginTop: 1 }} />
           <div>
-            <h4 className="font-medium text-sm">Smart Auto-mapping</h4>
-            <p className="text-xs text-slate-500 mt-1">Our engine automatically maps standard Tally and GST format columns.</p>
+            <p className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+              Smart Auto-mapping
+            </p>
+            <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+              Tally & GST Portal columns mapped automatically.
+            </p>
           </div>
         </div>
-        <div className="bg-amber-50/50 border border-amber-100 p-4 rounded-lg flex items-start gap-3">
-          <AlertTriangle className="text-amber-500 mt-1 flex-shrink-0" size={20} />
+        <div
+          className="p-3 rounded-xl flex items-start gap-3"
+          style={{ background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.25)' }}
+        >
+          <AlertTriangle size={16} style={{ color: '#f59e0b', flexShrink: 0, marginTop: 1 }} />
           <div>
-            <h4 className="font-medium text-sm text-amber-900">Data Requirements</h4>
-            <p className="text-xs text-amber-700 mt-1">Ensure GSTIN, Vendor Name, Invoice Number, and Tax Amount columns exist.</p>
+            <p className="text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+              Required Columns
+            </p>
+            <p className="text-[11px] mt-0.5" style={{ color: 'var(--text-muted)' }}>
+              GSTIN, Vendor Name, Invoice No., Tax Amount.
+            </p>
           </div>
         </div>
       </div>

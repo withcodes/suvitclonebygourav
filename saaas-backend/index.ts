@@ -295,6 +295,176 @@ app.post('/api/export', async (req, res) => {
   }
 });
 
+// ── In-memory Voucher Store (replace with DB in production) ──
+const voucherStore: any[] = [];
+
+// POST /api/vouchers — Save a new voucher created from the reco grid
+app.post('/api/vouchers', (req, res) => {
+  try {
+    const body = req.body;
+    if (!body.invoiceId || !body.voucherNo || !body.partyName) {
+      return res.status(400).json({ error: 'invoiceId, voucherNo, and partyName are required.' });
+    }
+    const voucher = {
+      id: Date.now(),
+      createdAt: new Date().toISOString(),
+      ...body,
+    };
+    voucherStore.push(voucher);
+    console.log(`📋 Voucher saved: ${voucher.voucherNo} for invoice ${voucher.invoiceId}`);
+    res.json({
+      success: true,
+      voucher,
+      updatedRow: { id: body.invoiceId, status: 'Manual-Matched' },
+    });
+  } catch (error) {
+    console.error('Voucher save error:', error);
+    res.status(500).json({ error: 'Failed to save voucher.' });
+  }
+});
+
+// GET /api/vouchers — List all saved vouchers
+app.get('/api/vouchers', (_req, res) => {
+  res.json({ count: voucherStore.length, vouchers: voucherStore });
+});
+
+// ── GSTR-1 Reconciliation (Sales Register vs GSTR-1 Portal) ──
+app.post('/api/reconcile/gstr1', upload.fields([{ name: 'salesFile' }, { name: 'gstr1File' }]), (req, res) => {
+  try {
+    const files = req.files as { [fieldname: string]: Express.Multer.File[] };
+    if (!files.salesFile || !files.gstr1File) {
+      return res.status(400).json({ error: 'Both Sales Register and GSTR-1 files are required.' });
+    }
+
+    // Parse Sales Register (Tally export)
+    const salesWb   = xlsx.read(files.salesFile[0].buffer, { type: 'buffer' });
+    const salesData = xlsx.utils.sheet_to_json(salesWb.Sheets[salesWb.SheetNames[0]]) as any[];
+
+    // Parse GSTR-1 Portal file
+    const gstr1Wb   = xlsx.read(files.gstr1File[0].buffer, { type: 'buffer' });
+    const gstr1Data = xlsx.utils.sheet_to_json(gstr1Wb.Sheets[gstr1Wb.SheetNames[0]]) as any[];
+
+    const results: any[] = [];
+    const matchedPortalIdx = new Set<number>();
+    let idCounter = 1;
+    const TOLERANCE = 2.00;
+
+    // PASS 1 — Exact Match (GSTIN + Invoice + Amount)
+    for (const sr of salesData) {
+      const srGstin   = sr['GSTIN/UIN'] || sr['Buyer GSTIN'] || sr['GSTIN'];
+      const srInvoice = sr['Voucher Number'] || sr['Invoice No'] || sr['Invoice Number'];
+      const srAmount  = parseAmount(sr['Tax Amount'] || sr['IGST'] || sr['CGST']);
+      let matched = false;
+
+      for (let i = 0; i < gstr1Data.length; i++) {
+        if (matchedPortalIdx.has(i)) continue;
+        const g = gstr1Data[i];
+        const gGstin   = g['Receiver GSTIN'] || g['GSTIN'] || g['GSTIN/UIN'];
+        const gInvoice = g['Invoice Number'] || g['Invoice No'] || g['Voucher Number'];
+        const gAmount  = parseAmount(g['Tax Amount'] || g['IGST'] || g['CGST']);
+
+        if (srGstin === gGstin && normalizeString(srInvoice) === normalizeString(gInvoice) && Math.abs(srAmount - gAmount) <= 0.01) {
+          results.push({
+            id: idCounter++,
+            vendor: sr['Party Name'] || g['Receiver Name'] || 'Unknown',
+            gstin: srGstin,
+            invoiceNo: srInvoice,
+            date: sr['Voucher Date'] || g['Invoice Date'],
+            prAmount: srAmount,
+            gstrAmount: gAmount,
+            status: 'Exact Match',
+          });
+          matchedPortalIdx.add(i);
+          sr._matched = true;
+          matched = true;
+          break;
+        }
+      }
+
+      // PASS 2 — Fuzzy match for same GSTIN
+      if (!matched) {
+        for (let i = 0; i < gstr1Data.length; i++) {
+          if (matchedPortalIdx.has(i)) continue;
+          const g = gstr1Data[i];
+          const gGstin  = g['Receiver GSTIN'] || g['GSTIN'] || g['GSTIN/UIN'];
+          if (srGstin !== gGstin) continue;
+
+          const gInvoice = g['Invoice Number'] || g['Invoice No'] || g['Voucher Number'];
+          const gAmount  = parseAmount(g['Tax Amount'] || g['IGST'] || g['CGST']);
+          const srN = normalizeInvoice(srInvoice);
+          const gN  = normalizeInvoice(gInvoice);
+          const srD = srN.match(/\d+$/)?.[0] || srN;
+          const gD  = gN.match(/\d+$/)?.[0] || gN;
+          const fuzzy = srN === gN || (srD.length >= 2 && gD.length >= 2 && (srD.includes(gD) || gD.includes(srD)));
+          const diff  = Math.abs(srAmount - gAmount);
+
+          if (fuzzy && diff <= TOLERANCE) {
+            results.push({
+              id: idCounter++,
+              vendor: sr['Party Name'] || g['Receiver Name'] || 'Unknown',
+              gstin: srGstin,
+              invoiceNo: srInvoice,
+              date: sr['Voucher Date'] || g['Invoice Date'],
+              prAmount: srAmount,
+              gstrAmount: gAmount,
+              status: diff <= 0.01 ? 'Fuzzy Match' : 'Amount Mismatch',
+            });
+            matchedPortalIdx.add(i);
+            sr._matched = true;
+            matched = true;
+            break;
+          }
+        }
+      }
+
+      if (!matched) {
+        results.push({
+          id: idCounter++,
+          vendor: sr['Party Name'] || 'Unknown',
+          gstin: srGstin || 'N/A',
+          invoiceNo: srInvoice || 'N/A',
+          date: sr['Voucher Date'] || 'N/A',
+          prAmount: parseAmount(sr['Tax Amount'] || sr['IGST'] || sr['CGST']),
+          gstrAmount: 0,
+          status: 'Not In Portal',  // Was Missing in 2B/GSTR-1
+        });
+      }
+    }
+
+    // Sweep GSTR-1 for unmatched portal entries
+    for (let i = 0; i < gstr1Data.length; i++) {
+      if (!matchedPortalIdx.has(i)) {
+        const g = gstr1Data[i];
+        results.push({
+          id: idCounter++,
+          vendor: g['Receiver Name'] || g['Trade Name'] || 'Unknown',
+          gstin: g['Receiver GSTIN'] || g['GSTIN'] || 'N/A',
+          invoiceNo: g['Invoice Number'] || g['Invoice No'] || 'N/A',
+          date: g['Invoice Date'] || 'N/A',
+          prAmount: 0,
+          gstrAmount: parseAmount(g['Tax Amount'] || g['IGST'] || g['CGST']),
+          status: 'Not In Tally', // Was Missing in PR
+        });
+      }
+    }
+
+    results.sort((a, b) => a.status.localeCompare(b.status));
+
+    const summary = {
+      totalReconciled: results.filter(r => ['Exact Match','Fuzzy Match','Amount Mismatch'].includes(r.status))
+        .reduce((sum, r) => sum + r.gstrAmount, 0),
+      itcAtRisk: results.filter(r => r.status === 'Not In Portal').reduce((sum, r) => sum + r.prAmount, 0),
+      pendingInvoices: results.filter(r => ['Not In Tally','Not In Portal'].includes(r.status)).length,
+      totalTaxSaved: results.reduce((sum, r) => sum + r.gstrAmount, 0),
+    };
+
+    res.json({ success: true, summary, data: results });
+  } catch (err) {
+    console.error('GSTR-1 reconciliation error:', err);
+    res.status(500).json({ error: 'Failed to process GSTR-1 files.' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.send('GST Reconciliation Engine is healthy 🚀');
 });

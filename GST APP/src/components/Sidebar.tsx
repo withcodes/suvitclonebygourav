@@ -1,55 +1,104 @@
-import { LayoutDashboard, FileSpreadsheet, Settings, LogOut, FileSearch, HelpCircle } from 'lucide-react';
+import {
+  LayoutDashboard, FileText, BookOpen, BarChart3,
+  Users, Settings, LogOut, FileSearch
+} from 'lucide-react';
+import { useTheme } from '../context/ThemeContext';
 
-export default function Sidebar() {
+interface SidebarProps {
+  activeTab: string;
+  onTabChange: (tab: string) => void;
+}
+
+export default function Sidebar({ activeTab, onTabChange }: SidebarProps) {
+  const { isDark, toggleTheme } = useTheme();
+
   const navItems = [
-    { icon: LayoutDashboard, label: 'Dashboard', active: true },
-    { icon: FileSearch, label: 'Reconciliation', active: false },
-    { icon: FileSpreadsheet, label: 'Reports', active: false },
-    { icon: Settings, label: 'Settings', active: false },
+    { id: 'dashboard',  icon: LayoutDashboard, label: 'Dashboard' },
+    { id: 'gstr1',      icon: FileText,        label: 'GSTR-1 Reco' },
+    { id: 'gstr2b',     icon: BookOpen,        label: 'GSTR-2B Reco' },
+    { id: 'monthly',    icon: BarChart3,        label: 'Monthly View' },
+    { id: 'clients',    icon: Users,            label: 'Clients' },
+    { id: 'settings',   icon: Settings,         label: 'Settings' },
   ];
 
   return (
-    <div className="w-64 h-screen bg-slate-900 text-slate-300 flex flex-col pt-6 sticky top-0">
-      <div className="px-6 mb-10 flex items-center gap-3">
-        <div className="bg-primary-500 rounded-lg p-2 text-white shadow-lg shadow-primary-500/20">
-          <FileSearch size={24} />
+    <div
+      className="glass-sidebar flex flex-col pt-6 sticky top-0 h-screen"
+      style={{ width: 'var(--sidebar-w)', minWidth: 'var(--sidebar-w)' }}
+    >
+      {/* ── Logo ── */}
+      <div className="px-5 mb-8 flex items-center gap-3">
+        <div
+          className="p-2 rounded-xl animate-pulse-glow"
+          style={{ background: 'linear-gradient(135deg,#4f46e5,#7c3aed)' }}
+        >
+          <FileSearch size={22} color="white" />
         </div>
         <div>
-          <h1 className="text-xl font-bold text-white tracking-wide">Suvit<span className="text-primary-400">Clone</span></h1>
-          <p className="text-[10px] uppercase tracking-wider text-slate-500">GST Automation</p>
+          <h1 className="text-lg font-bold tracking-wide" style={{ color: 'var(--text-primary)' }}>
+            GST<span style={{ color: '#818cf8' }}>Sync</span>
+          </h1>
+          <p className="text-[10px] uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
+            GST Automation
+          </p>
         </div>
       </div>
 
-      <nav className="flex-1 px-4 space-y-2">
-        {navItems.map((item, i) => (
-          <button 
-            key={i} 
-            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${
-              item.active 
-                ? 'bg-primary-600/10 text-primary-400 border border-primary-500/20 shadow-[0_0_15px_rgba(99,102,241,0.1)]' 
-                : 'hover:bg-slate-800 hover:text-white'
-            }`}
+      {/* ── Navigation ── */}
+      <nav className="flex-1 px-3 space-y-1">
+        {navItems.map(item => (
+          <button
+            key={item.id}
+            onClick={() => onTabChange(item.id)}
+            className={`nav-item w-full text-left ${activeTab === item.id ? 'active' : ''}`}
           >
-            <item.icon size={20} className={item.active ? 'text-primary-400' : 'text-slate-400'} />
-            <span className="font-medium text-sm">{item.label}</span>
+            <item.icon size={18} />
+            <span>{item.label}</span>
           </button>
         ))}
       </nav>
 
-      <div className="p-4 mb-4">
-        <div className="bg-slate-800 rounded-xl p-4 text-sm border border-slate-700/50">
-          <div className="flex items-center gap-2 mb-2 text-white font-medium">
-            <HelpCircle size={16} /> Need help?
+      {/* ── Theme Toggle ── */}
+      <div className="px-3 mb-3">
+        <button className="theme-toggle" onClick={toggleTheme} aria-label="Toggle theme">
+          <div className="flex items-center gap-2">
+            <span style={{ color: !isDark ? '#f59e0b' : 'var(--text-muted)', fontSize: 15 }}>☀️</span>
+            <span className="text-xs font-medium" style={{ color: 'var(--text-secondary)' }}>
+              {isDark ? 'Dark Mode' : 'Light Mode'}
+            </span>
           </div>
-          <p className="text-xs text-slate-400 mb-3">Check out our guide on how to resolve mismatches efficiently.</p>
-          <button className="text-xs text-primary-400 font-medium hover:text-primary-300">Read Docs</button>
-        </div>
+          <div className="flex items-center gap-1.5">
+            <span style={{ color: isDark ? '#818cf8' : 'var(--text-muted)', fontSize: 15 }}>🌙</span>
+            {/* Track */}
+            <div className="toggle-track">
+              <div className="toggle-thumb" />
+            </div>
+          </div>
+        </button>
       </div>
 
-      <div className="border-t border-slate-800 p-4">
-        <button className="flex items-center gap-3 text-sm font-medium hover:text-white transition-colors w-full px-4 py-2">
-          <LogOut size={18} className="text-rose-400" />
-          <span>Logout</span>
+      {/* ── User + Logout ── */}
+      <div
+        className="mx-3 mb-4 p-3 rounded-xl flex items-center gap-3"
+        style={{ background: 'var(--bg-hover)', border: '1px solid var(--border-subtle)' }}
+      >
+        <div
+          className="w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center text-white text-sm font-bold"
+          style={{ background: 'linear-gradient(135deg,#4f46e5,#7c3aed)' }}
+        >
+          G
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-semibold truncate" style={{ color: 'var(--text-primary)' }}>
+            Gaurav Patel
+          </p>
+          <p className="text-[10px]" style={{ color: 'var(--text-muted)' }}>Admin</p>
+        </div>
+        <button
+          className="flex-shrink-0 p-1 rounded-lg hover:bg-red-500/10 transition-colors"
+          title="Logout"
+        >
+          <LogOut size={15} color="#f43f5e" />
         </button>
       </div>
     </div>
