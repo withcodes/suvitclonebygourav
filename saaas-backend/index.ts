@@ -3,6 +3,7 @@ import cors from 'cors';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
 import ExcelJS from 'exceljs';
+import path from 'path';
 
 const app = express();
 const port = process.env.PORT || 3001;
@@ -45,6 +46,137 @@ const normalizeInvoice = (str: string | undefined | null) => {
     return cleaned;
 };
 
+// ── Dynamic Excel Parsing Utilities ──
+
+// Convert Excel serial dates (e.g. 45778) to JS Dates
+const excelDateToJSDate = (serial: number | string) => {
+  if (typeof serial === 'number') {
+    const utc_days  = Math.floor(serial - 25569);
+    const utc_value = utc_days * 86400;                                        
+    const dateInfo  = new Date(utc_value * 1000);
+    return dateInfo.toISOString().slice(0, 10); // YYYY-MM-DD
+  }
+  return serial;
+};
+
+// Normalize string dates (e.g. 09/05/2025 -> 2025-05-09)
+const normalizeDateString = (dateStr: string | number) => {
+  if (!dateStr) return 'N/A';
+  if (typeof dateStr === 'number') return excelDateToJSDate(dateStr);
+  const str = dateStr.toString().trim();
+  // Handle DD/MM/YYYY
+  const parts = str.match(/^(\d{2})[\/\-](\d{2})[\/\-](\d{4})$/);
+  if (parts) return `${parts[3]}-${parts[2]}-${parts[1]}`;
+  return str;
+};
+
+// Dynamic Heuristic Header Scanner & Data Extractor
+const parseDynamicSheet = (sheet: xlsx.WorkSheet, sheetName: string) => {
+  // Strip hidden control characters (e.g., zero-width spaces)
+  const cleanSheetName = sheetName.replace(/[^\x20-\x7E]/g, '').trim().toUpperCase();
+
+  const SKIP_SHEET_NAMES = ['READ ME', 'ITC AVAILABLE', 'ITC NOT AVAILABLE', 'ITC REVERSAL', 'ITC REJECTED'];
+  if (SKIP_SHEET_NAMES.some(s => cleanSheetName === s || cleanSheetName.includes(s))) {
+    return [];
+  }
+
+  // Read absolute raw 2D array
+  console.log(`[parseDynamicSheet] Processing ${sheetName} (cleaned: ${cleanSheetName}), !ref = ${sheet['!ref']}`);
+  const rawData = xlsx.utils.sheet_to_json(sheet, { header: 1, defval: "" }) as any[][];
+  console.log(`[parseDynamicSheet] ${sheetName} rawData contains ${rawData.length} rows.`);
+  let headerIndex = -1;
+
+  // The keywords that define a true data table inside GST files
+  const requiredKeywords = ['GSTIN', 'INVOICE', 'TAXABLE'];
+  
+  // Scan down to row 20 to find the floating header
+  for (let i = 0; i < Math.min(20, rawData.length); i++) {
+    const row = rawData[i];
+    if (!row) continue;
+    const rowString = row.join('').toUpperCase();
+    
+    // We require these substrings to exist aggressively
+    const hasGstin = rowString.includes('GSTIN');
+    const hasInvoice = rowString.includes('INVOICE') || rowString.includes('DOCUMENT') || rowString.includes('VOUCHER') || rowString.includes('NOTE');
+    const hasTaxable = rowString.includes('TAXABLE') || rowString.includes('TAX PAID') || rowString.includes('AMOUNT');
+    
+    // Require a cell that STARTS WITH 'GSTIN' (not just contains it in a description)
+    const hasGstinHeader = row.some((cell: any) => cell && cell.toString().toUpperCase().trim().startsWith('GSTIN'));
+    
+
+
+    // If it hits header-level match, also verify the NEXT rows look like real GSTIN data (15-char alphanumeric)
+    if (hasGstinHeader && (hasInvoice || hasTaxable)) {
+      // Quick-verify: does one of the next 3 rows have a GSTIN-looking value?
+      let nextRowHasGstinData = false;
+      for (let j = 1; j <= 3; j++) {
+          const nextRow = rawData[i + j];
+          if (nextRow && nextRow.some((cell: any) => {
+            const s = cell ? cell.toString().trim() : '';
+            const isValid = s.length === 15 && /^[0-9A-Z]+$/.test(s);
+            return isValid;
+          })) {
+              nextRowHasGstinData = true;
+              break;
+          }
+      }
+
+      if (nextRowHasGstinData || i === 0) {
+        headerIndex = i;
+        break;
+      }
+    }
+  }
+
+  if (headerIndex === -1) {
+    console.log(`[parseDynamicSheet] ${sheetName}: No headers found. (rawData length: ${rawData.length})`);
+    return [];
+  }
+
+  const headers = rawData[headerIndex].map((h: any) => h ? h.toString().trim().replace(/[\n\r]/g, '') : `UNKNOWN_${Math.random()}`);
+  const extractedRecords = [];
+  
+  console.log(`[parseDynamicSheet] ${sheetName}: Found headers on row ${headerIndex+1}:`, headers.filter(h => !h.startsWith('UNKNOWN_')).join(', ').substring(0, 200));
+
+  // Parse pure data rows underneath the found header
+  let loggedRows = 0;
+  for (let i = headerIndex + 1; i < rawData.length; i++) {
+    const row = rawData[i];
+    // Skip completely empty arrays or arrays with no length
+    if (!row || row.length === 0 || row.every(cell => cell === "" || cell == null)) continue;
+
+    const record: any = { _sourceSheet: sheetName };
+    headers.forEach((header, index) => {
+      // Add data mapped to its header
+      record[header] = row[index];
+    });
+    
+    // Extra safety: If the record has NO gstin and NO invoice, it's just a rogue totals row or footer
+    const possibleGstins = record['GSTIN of supplier'] || record['GSTIN of Supplier'] || record['GSTIN'] || record['GSTIN/UIN'] || record['GSTIN of ECO'] || record['GSTIN of ISD'];
+    const possibleInvoices = record['Invoice number'] || record['Invoice Number'] || record['Invoice No'] || record['Voucher Number'] || record['Document number'] || record['Note number'];
+    
+    const gstinStr = possibleGstins ? possibleGstins.toString().trim() : '';
+    const invoiceStr = possibleInvoices ? possibleInvoices.toString().trim() : '';
+    
+    const isValidGstin = gstinStr.length > 0 && gstinStr.length <= 30;
+    const isValidInvoice = invoiceStr.length > 0 && invoiceStr.length <= 50;
+    
+    if (loggedRows < 3) {
+      console.log(`[parseDynamicSheet] ${sheetName} Row ${i+1} check: gstin='${gstinStr}' (valid=${isValidGstin}), invoice='${invoiceStr}' (valid=${isValidInvoice})`);
+      loggedRows++;
+    }
+
+    if (isValidGstin || isValidInvoice) {
+        extractedRecords.push(record);
+    }
+  }
+
+  console.log(`[parseDynamicSheet] ${sheetName}: Loaded ${extractedRecords.length} records.`);
+  return extractedRecords;
+
+  return extractedRecords;
+};
+
 // Reconciliation Logic
 app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFile' }]), (req, res) => {
   try {
@@ -54,15 +186,89 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
         return res.status(400).json({ error: 'Both Purchase Register and GSTR-2B files are required.' });
     }
 
-    // 1. Parse Purchase Register
-    const prWorkbook = xlsx.read(files.prFile[0].buffer, { type: 'buffer' });
-    const prSheetName = prWorkbook.SheetNames[0];
-    const prData = xlsx.utils.sheet_to_json(prWorkbook.Sheets[prSheetName]) as any[];
+    // 1. Parse Purchase Register (Dynamically finds headers)
+    const tempPrPath = path.join(require('os').tmpdir(), 'temp_pr.xlsx');
+    const fs = require('fs');
+    fs.writeFileSync(tempPrPath, files.prFile[0].buffer);
+    const prWorkbook = xlsx.readFile(tempPrPath);
+    
+    let prData: any[] = [];
+    // Sheets in Tally GSTR-2 export that contain invoice-level data (actual names from file)
+    const PR_DATA_SHEETS = ['B2B', 'b2bur', 'cdnr', 'cdnur', 'impg', 'imps'];
+    for (const sheetName of prWorkbook.SheetNames) {
+        if (PR_DATA_SHEETS.some(s => sheetName.toLowerCase() === s.toLowerCase())) {
+            const sheetData = parseDynamicSheet(prWorkbook.Sheets[sheetName], sheetName);
+            console.log(`PR sheet [${sheetName}]: ${sheetData.length} rows parsed`);
+            prData = prData.concat(sheetData);
+        } else {
+            console.log(`PR: Skipping non-data sheet: ${sheetName}`);
+        }
+    }
 
-    // 2. Parse GSTR-2B
-    const gstrWorkbook = xlsx.read(files.gstr2bFile[0].buffer, { type: 'buffer' });
-    const gstrSheetName = gstrWorkbook.SheetNames[0];
-    const gstrData = xlsx.utils.sheet_to_json(gstrWorkbook.Sheets[gstrSheetName]) as any[];
+    // 2. Parse GSTR-2B (Loops all data sheets dynamically)
+    const tempGstrPath = path.join(require('os').tmpdir(), 'temp_gstr2b.xlsx');
+    fs.writeFileSync(tempGstrPath, files.gstr2bFile[0].buffer);
+    const gstrWorkbook = xlsx.readFile(tempGstrPath);
+    
+    let gstrData: any[] = [];
+    // Skip summary/instruction sheets — process ALL other sheets as data sheets
+    const GSTR_SKIP_SHEETS = ['Read me', 'ITC Available', 'ITC not available', 'ITC Reversal', 'ITC Rejected'];
+    for (const sheetName of gstrWorkbook.SheetNames) {
+        if (GSTR_SKIP_SHEETS.some(s => sheetName.toLowerCase() === s.toLowerCase())) {
+            console.log(`GSTR-2B: Skipping summary/instruction sheet: ${sheetName}`);
+            continue;
+        }
+        let sheetData = parseDynamicSheet(gstrWorkbook.Sheets[sheetName], sheetName);
+        console.log(`GSTR-2B sheet [${sheetName}]: ${sheetData.length} rows parsed`);
+        // --- ARCHITECTURE PROTOCOL: Negate Reversals & Amendments ---
+        sheetData = sheetData.map(row => {
+            const isReversal = sheetName.includes('CDNR') || sheetName.includes('Reversal');
+            const isAmendment = sheetName.includes('A'); // B2BA, CDNRA
+            
+            // For amendments, shift the revised figures into the main figures
+            if (isAmendment) {
+                if (row['Revised Taxable value (₹)']) row['Taxable Value (₹)'] = row['Revised Taxable value (₹)'];
+                if (row['Revised Tax Amount']) row['Tax Amount'] = row['Revised Tax Amount']; // generic fallback
+                if (row['Revised Integrated Tax(₹)']) row['Integrated Tax(₹)'] = row['Revised Integrated Tax(₹)'];
+                if (row['Revised Central Tax(₹)']) row['Central Tax(₹)'] = row['Revised Central Tax(₹)'];
+                if (row['Revised State/UT Tax(₹)']) row['State/UT Tax(₹)'] = row['Revised State/UT Tax(₹)'];
+            }
+
+            // For Reversals & Credit Notes, negate the values so they subtract 
+            if (isReversal) {
+                // Determine absolute tax amount
+                let absAmount = parseAmount(row['Tax Amount'] || row['Integrated Tax(₹)'] || row['Central Tax(₹)']);
+                if (row['Integrated Tax(₹)'] && row['Central Tax(₹)']) {
+                     absAmount = parseAmount(row['Integrated Tax(₹)']) + parseAmount(row['Central Tax(₹)']) + parseAmount(row['State/UT Tax(₹)']);
+                }
+                row['Tax Amount'] = absAmount * -1; 
+                row['Taxable Value (₹)'] = parseAmount(row['Taxable Value (₹)']) * -1;
+            }
+
+            return row;
+        });
+
+        gstrData = gstrData.concat(sheetData);
+    }
+
+    // --- PURITY FILTER: Drop blank rows only — require GSTIN or Invoice to exist ---
+    prData = prData.filter(row => {
+        // Tally uses 'GSTIN of Supplier' (capital S) and 'Invoice Number' (capital N)
+        const gst = String(row['GSTIN of Supplier'] || row['GSTIN/UIN'] || row['GSTIN'] || '').replace(/undefined/g, '').trim();
+        const inv = String(row['Invoice Number'] || row['Voucher Number'] || row['Invoice No'] || '').replace(/undefined/g, '').trim();
+        return gst.length > 2 || inv.length > 2;
+    });
+
+    gstrData = gstrData.filter(row => {
+        const gst = String(row['GSTIN of supplier'] || row['GSTIN of Supplier'] || row['GSTIN'] || row['GSTIN of ECO'] || row['GSTIN of ISD'] || '').replace(/undefined/g, '').trim();
+        const inv = String(row['Invoice number'] || row['Invoice Number'] || row['Invoice No'] || row['Document number'] || row['Note number'] || '').replace(/undefined/g, '').trim();
+        return gst.length > 2 || inv.length > 2;
+    });
+
+    console.log("=== RAW PR DATA SAMPLE ===");
+    console.log(prData.slice(0, 3));
+    console.log("=== RAW GSTR DATA SAMPLE ===");
+    console.log(gstrData.slice(0, 3));
 
     const results = [];
     const matchedGstrIndices = new Set<number>();
@@ -74,9 +280,13 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
 
     // PASS 1: Strict Exact Matches
     for (const prRow of prData) {
-        const prGstin = prRow['GSTIN/UIN'] || prRow['GSTIN'];
-        const prInvoice = prRow['Voucher Number'] || prRow['Invoice No'];
-        const prAmount = parseAmount(prRow['Tax Amount']);
+        // Tally exact column names (confirmed from file analysis)
+        const prGstin = prRow['GSTIN of Supplier'] || prRow['GSTIN/UIN'] || prRow['GSTIN'];
+        const prInvoice = prRow['Invoice Number'] || prRow['Voucher Number'] || prRow['Invoice No'];
+        const prDate = normalizeDateString(prRow['Invoice date'] || prRow['Voucher Date'] || prRow['Invoice Date']);
+        const prAmount = parseAmount(prRow['Integrated Tax Paid'] || prRow['Central Tax Paid'] || prRow['Tax Amount'] || 0);
+        
+        if (!prGstin || prGstin === 'undefined' || !prInvoice || prInvoice === 'undefined') continue;
         
         let pass1Match = false;
 
@@ -84,24 +294,34 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
             if (matchedGstrIndices.has(i)) continue;
 
             const gstrRow = gstrData[i];
-            const gstrGstin = gstrRow['GSTIN of supplier'] || gstrRow['GSTIN'];
-            const gstrInvoice = gstrRow['Invoice number'] || gstrRow['Invoice No'];
-            const gstrAmount = parseAmount(gstrRow['Tax Amount']);
+            // GSTR-2B exact column names (confirmed from file analysis)
+            const gstrGstin = gstrRow['GSTIN of supplier'] || gstrRow['GSTIN of Supplier'] || gstrRow['GSTIN'] || gstrRow['GSTIN of ECO'] || gstrRow['GSTIN of ISD'];
+            // B2B sheet: row 5 header is 'Invoice Details' (parent), actual invoice number col
+            const gstrInvoice = gstrRow['Invoice number'] || gstrRow['Invoice Number'] || gstrRow['Invoice Details'] || gstrRow['Document number'] || gstrRow['Note number'];
+            const gstrDate = normalizeDateString(gstrRow['Invoice date'] || gstrRow['Invoice Date'] || gstrRow['Document date']);
+            // GSTR-2B tax: Integrated Tax(₹) for IGST, Central Tax(₹) for CGST
+            const gstrAmount = parseAmount(gstrRow['Integrated Tax(\u20b9)'] || gstrRow['Central Tax(\u20b9)'] || gstrRow['Tax Amount'] || 0);
+            
+            if (!gstrGstin && !gstrInvoice) continue;
 
-            if (prGstin === gstrGstin && normalizeString(prInvoice) === normalizeString(gstrInvoice) && Math.abs(prAmount - gstrAmount) <= 0.01) {
+            if (normalizeString(prGstin) === normalizeString(gstrGstin) &&
+                normalizeString(prInvoice) === normalizeString(gstrInvoice) &&
+                Math.abs(prAmount - gstrAmount) <= 2.0) {
                 results.push({
                     id: idCounter++,
-                    vendor: prRow['Party Name'] || gstrRow['Trade/Legal name'] || 'Unknown',
+                    vendor: prRow['Supplier Name'] || gstrRow['Trade/Legal name'] || prGstin,
                     gstin: prGstin,
                     invoiceNo: prInvoice,
-                    date: prRow['Voucher Date'] || gstrRow['Invoice date'],
+                    date: prDate || gstrDate,
                     prAmount: prAmount,
                     gstrAmount: gstrAmount,
-                    status: 'Exact Match'
+                    status: 'Exact Match',
+                    _prRaw: prRow,
+                    _gstrRaw: gstrRow
                 });
                 matchedGstrIndices.add(i);
                 pass1Match = true;
-                prRow._matched = true; // Mark PR row as matched
+                prRow._matched = true;
                 break;
             }
         }
@@ -111,9 +331,12 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
     for (const prRow of prData) {
         if (prRow._matched) continue;
 
-        const prGstin = prRow['GSTIN/UIN'] || prRow['GSTIN'];
-        const prInvoice = prRow['Voucher Number'] || prRow['Invoice No'];
-        const prAmount = parseAmount(prRow['Tax Amount']);
+        const prGstin = prRow['GSTIN of Supplier'] || prRow['GSTIN/UIN'] || prRow['GSTIN'];
+        const prInvoice = prRow['Invoice Number'] || prRow['Voucher Number'] || prRow['Invoice No'];
+        const prDate = normalizeDateString(prRow['Invoice date'] || prRow['Voucher Date']);
+        const prAmount = parseAmount(prRow['Integrated Tax Paid'] || prRow['Central Tax Paid'] || prRow['Tax Amount'] || 0);
+        
+        if (!prGstin || prGstin === 'undefined' || !prInvoice || prInvoice === 'undefined') continue;
         
         let pass2Match = false;
 
@@ -121,41 +344,43 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
             if (matchedGstrIndices.has(i)) continue;
 
             const gstrRow = gstrData[i];
-            const gstrGstin = gstrRow['GSTIN of supplier'] || gstrRow['GSTIN'];
+            const gstrGstin = gstrRow['GSTIN of supplier'] || gstrRow['GSTIN of Supplier'] || gstrRow['GSTIN'] || gstrRow['GSTIN of ECO'] || gstrRow['GSTIN of ISD'];
             
-            // Only fuzzy match against same GSTIN
-            if (prGstin !== gstrGstin) continue;
+            if (normalizeString(prGstin) !== normalizeString(gstrGstin)) continue;
 
-            const gstrInvoice = gstrRow['Invoice number'] || gstrRow['Invoice No'];
-            const gstrAmount = parseAmount(gstrRow['Tax Amount']);
+            // B2B sheet: row 5 header is 'Invoice Details' (parent merged cell)
+            const gstrInvoice = gstrRow['Invoice number'] || gstrRow['Invoice Number'] || gstrRow['Invoice Details'] || gstrRow['Document number'] || gstrRow['Note number'];
+            const gstrDate = normalizeDateString(gstrRow['Invoice date'] || gstrRow['Invoice Date'] || gstrRow['Document date']);
+            const gstrAmount = parseAmount(gstrRow['Integrated Tax(\u20b9)'] || gstrRow['Central Tax(\u20b9)'] || gstrRow['Tax Amount'] || 0);
 
             const prInvNorm = normalizeInvoice(prInvoice);
             const gstrInvNorm = normalizeInvoice(gstrInvoice);
             
-            // Extract purely the trailing numerical digits to match `00045` with `INV45`
             const prDigits = prInvNorm.match(/\d+$/)?.[0] || prInvNorm;
             const gstrDigits = gstrInvNorm.match(/\d+$/)?.[0] || gstrInvNorm;
 
-            // Allow matched invoice if normalized strings hit
-            // Check for trailing digit matches if one is a substring of the other
-            const isFuzzyInvoiceMatch = (prInvNorm === gstrInvNorm) || 
+            const isFuzzyInvoiceMatch = (prInvNorm.length >= 3 && gstrInvNorm.length >= 3) && (
+                                        (prInvNorm === gstrInvNorm) || 
                                         ((prDigits.length >= 2 && gstrDigits.length >= 2) && 
                                         (prDigits.includes(gstrDigits) || gstrDigits.includes(prDigits))) ||
-                                        (prInvNorm.length >= 3 && gstrInvNorm.includes(prInvNorm)) ||
-                                        (gstrInvNorm.length >= 3 && prInvNorm.includes(gstrInvNorm));
+                                        (gstrInvNorm.includes(prInvNorm)) ||
+                                        (prInvNorm.includes(gstrInvNorm))
+                                      );
 
             const amountDiff = Math.abs(prAmount - gstrAmount);
 
             if (isFuzzyInvoiceMatch && amountDiff <= TOLERANCE_LIMIT) {
                 results.push({
                     id: idCounter++,
-                    vendor: prRow['Party Name'] || gstrRow['Trade/Legal name'] || 'Unknown',
+                    vendor: prRow['Supplier Name'] || gstrRow['Trade/Legal name'] || prGstin,
                     gstin: prGstin,
                     invoiceNo: prInvoice,
-                    date: prRow['Voucher Date'] || gstrRow['Invoice date'],
+                    date: prDate || gstrDate,
                     prAmount: prAmount,
                     gstrAmount: gstrAmount,
-                    status: amountDiff <= 0.01 ? 'Fuzzy Match' : 'Amount Mismatch'
+                    status: amountDiff <= 0.01 ? 'Fuzzy Match' : 'Amount Mismatch',
+                    _prRaw: prRow,
+                    _gstrRaw: gstrRow
                 });
                 matchedGstrIndices.add(i);
                 pass2Match = true;
@@ -164,17 +389,17 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
             }
         }
 
-        // Output Missing in 2B
         if (!pass2Match) {
             results.push({
                 id: idCounter++,
-                vendor: prRow['Party Name'] || 'Unknown',
+                vendor: prRow['Supplier Name'] || prGstin || 'Unknown',
                 gstin: prGstin || 'N/A',
                 invoiceNo: prInvoice || 'N/A',
-                date: prRow['Voucher Date'] || 'N/A',
+                date: prDate || 'N/A',
                 prAmount: prAmount,
                 gstrAmount: 0,
-                status: 'Missing in 2B'
+                status: 'Missing in 2B',
+                _prRaw: prRow
             });
         }
     }
@@ -183,15 +408,19 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
     for (let i = 0; i < gstrData.length; i++) {
         if (!matchedGstrIndices.has(i)) {
             const gstrRow = gstrData[i];
+            const gstrDate = normalizeDateString(gstrRow['Invoice date'] || gstrRow['Invoice Date'] || gstrRow['Document date'] || gstrRow['ISD Document date'] || gstrRow['Note date']);
+            const gstrAmount = parseAmount(gstrRow['Tax Amount'] || gstrRow['Integrated Tax(₹)'] || gstrRow['Central Tax(₹)'] || gstrRow['Tax amount'] || 0);
+
             results.push({
                 id: idCounter++,
                 vendor: gstrRow['Trade/Legal name'] || 'Unknown',
-                gstin: gstrRow['GSTIN of supplier'] || gstrRow['GSTIN'] || 'N/A',
-                invoiceNo: gstrRow['Invoice number'] || gstrRow['Invoice No'] || 'N/A',
-                date: gstrRow['Invoice date'] || 'N/A',
+                gstin: gstrRow['GSTIN of supplier'] || gstrRow['GSTIN'] || gstrRow['GSTIN of ECO'] || gstrRow['GSTIN of ISD'] || 'N/A',
+                invoiceNo: gstrRow['Invoice number'] || gstrRow['Invoice No'] || gstrRow['Document number'] || gstrRow['ISD Document number'] || gstrRow['Note number'] || 'N/A',
+                date: gstrDate || 'N/A',
                 prAmount: 0,
-                gstrAmount: parseAmount(gstrRow['Tax Amount']),
-                status: 'Missing in PR'
+                gstrAmount: gstrAmount,
+                status: 'Missing in PR',
+                _gstrRaw: gstrRow
             });
         }
     }
