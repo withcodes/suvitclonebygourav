@@ -408,14 +408,15 @@ app.post('/api/reconcile', upload.fields([{ name: 'prFile' }, { name: 'gstr2bFil
     for (let i = 0; i < gstrData.length; i++) {
         if (!matchedGstrIndices.has(i)) {
             const gstrRow = gstrData[i];
+            const gstrInvoice = gstrRow['Invoice number'] || gstrRow['Invoice Number'] || gstrRow['Invoice Details'] || gstrRow['Document number'] || gstrRow['Note number'];
             const gstrDate = normalizeDateString(gstrRow['Invoice date'] || gstrRow['Invoice Date'] || gstrRow['Document date'] || gstrRow['ISD Document date'] || gstrRow['Note date']);
-            const gstrAmount = parseAmount(gstrRow['Tax Amount'] || gstrRow['Integrated Tax(₹)'] || gstrRow['Central Tax(₹)'] || gstrRow['Tax amount'] || 0);
+            const gstrAmount = parseAmount(gstrRow['Integrated Tax(\u20b9)'] || gstrRow['Central Tax(\u20b9)'] || gstrRow['Tax Amount'] || 0);
 
             results.push({
                 id: idCounter++,
                 vendor: gstrRow['Trade/Legal name'] || 'Unknown',
-                gstin: gstrRow['GSTIN of supplier'] || gstrRow['GSTIN'] || gstrRow['GSTIN of ECO'] || gstrRow['GSTIN of ISD'] || 'N/A',
-                invoiceNo: gstrRow['Invoice number'] || gstrRow['Invoice No'] || gstrRow['Document number'] || gstrRow['ISD Document number'] || gstrRow['Note number'] || 'N/A',
+                gstin: gstrRow['GSTIN of supplier'] || gstrRow['GSTIN of Supplier'] || gstrRow['GSTIN'] || gstrRow['GSTIN of ECO'] || gstrRow['GSTIN of ISD'] || 'N/A',
+                invoiceNo: gstrInvoice || 'N/A',
                 date: gstrDate || 'N/A',
                 prAmount: 0,
                 gstrAmount: gstrAmount,
