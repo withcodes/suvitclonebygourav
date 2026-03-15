@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, Fragment } from 'react';
 import {
   Search, Filter, Download, Plus, Loader2, X,
 } from 'lucide-react';
@@ -22,6 +22,13 @@ export default function ReconciliationGrid({
   const [activeFilters,   setActiveFilters]   = useState<RecoStatus[]>([]);
   const [voucherRow,      setVoucherRow]      = useState<ReconciledItem | null>(null);
   const [isExporting,     setIsExporting]     = useState(false);
+  const [expandedRows,    setExpandedRows]    = useState<number[]>([]);
+
+  const toggleRow = (id: number) => {
+    setExpandedRows(prev =>
+      prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]
+    );
+  };
 
   // Normalise status from backend values → RecoStatus
   const normalise = (s: string): RecoStatus => {
@@ -230,42 +237,83 @@ export default function ReconciliationGrid({
               {rows.map(row => {
                 const status = normalise(row.status);
                 const meta   = STATUS_META[status];
+                const isExpanded = expandedRows.includes(row.id);
+                
                 return (
-                  <tr key={row.id} className="tbl-row">
-                    <td className="px-4 py-3 font-medium" style={{ color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>
-                      {row.vendor}
-                    </td>
-                    <td className="px-4 py-3 font-mono text-xs" style={{ color: 'var(--text-secondary)' }}>
-                      {row.gstin}
-                    </td>
-                    <td className="px-4 py-3" style={{ color: 'var(--text-secondary)' }}>
-                      {row.invoiceNo}
-                    </td>
-                    <td className="px-4 py-3 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>
-                      {row.date}
-                    </td>
-                    <td className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
-                      {fmt(row.prAmount)}
-                    </td>
-                    <td className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
-                      {fmt(row.gstrAmount)}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={meta.pillClass}>{meta.label}</span>
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      {status === 'Not In Tally' ? (
-                        <button
-                          className="btn-voucher"
-                          onClick={() => setVoucherRow(row)}
-                        >
-                          <Plus size={12} /> Add Voucher
-                        </button>
-                      ) : (
-                        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>—</span>
-                      )}
-                    </td>
-                  </tr>
+                  <Fragment key={row.id}>
+                    <tr 
+                      className="tbl-row cursor-pointer hover:bg-black/10 transition-colors" 
+                      onClick={() => toggleRow(row.id)}
+                    >
+                      <td className="px-4 py-3 font-medium" style={{ color: 'var(--text-primary)', whiteSpace: 'nowrap' }}>
+                        {row.vendor}
+                      </td>
+                      <td className="px-4 py-3 font-mono text-xs" style={{ color: 'var(--text-secondary)' }}>
+                        {row.gstin}
+                      </td>
+                      <td className="px-4 py-3" style={{ color: 'var(--text-secondary)' }}>
+                        {row.invoiceNo}
+                      </td>
+                      <td className="px-4 py-3 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>
+                        {row.date}
+                      </td>
+                      <td className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
+                        {fmt(row.prAmount)}
+                      </td>
+                      <td className="px-4 py-3 text-right font-medium" style={{ color: 'var(--text-primary)' }}>
+                        {fmt(row.gstrAmount)}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={meta.pillClass}>{meta.label}</span>
+                      </td>
+                      <td className="px-4 py-3 text-center" onClick={(e) => e.stopPropagation()}>
+                        {status === 'Not In Tally' ? (
+                          <button
+                            className="btn-voucher"
+                            onClick={() => setVoucherRow(row)}
+                          >
+                            <Plus size={12} /> Add Voucher
+                          </button>
+                        ) : (
+                          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>—</span>
+                        )}
+                      </td>
+                    </tr>
+                    {isExpanded && (
+                      <tr style={{ background: 'var(--bg-hover)' }}>
+                        <td colSpan={8} className="px-4 py-4">
+                          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                            {row._prRaw && (
+                              <div className="p-3 rounded-xl border" style={{ background: 'var(--bg-base)', borderColor: 'var(--border-subtle)' }}>
+                                <h4 className="font-semibold text-base mb-2" style={{ color: 'var(--text-accent)' }}>Purchase Register Item</h4>
+                                <div className="space-y-1">
+                                  {Object.entries(row._prRaw).filter(([_, v]) => v !== "").map(([k, v]) => (
+                                    <div key={k} className="flex justify-between gap-2 border-b border-dashed" style={{ borderColor: 'rgba(255,255,255,0.05)', paddingBottom: 2 }}>
+                                      <span style={{ color: 'var(--text-muted)' }}>{k}:</span>
+                                      <span className="font-mono text-right" style={{ color: 'var(--text-primary)' }}>{String(v)}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {row._gstrRaw && (
+                              <div className="p-3 rounded-xl border" style={{ background: 'var(--bg-base)', borderColor: 'var(--border-subtle)' }}>
+                                <h4 className="font-semibold text-base mb-2" style={{ color: '#10b981' }}>GSTR-2B Item</h4>
+                                <div className="space-y-1">
+                                  {Object.entries(row._gstrRaw).filter(([k, v]) => v !== "" && !k.startsWith('UNKNOWN_')).map(([k, v]) => (
+                                    <div key={k} className="flex justify-between gap-2 border-b border-dashed" style={{ borderColor: 'rgba(255,255,255,0.05)', paddingBottom: 2 }}>
+                                      <span style={{ color: 'var(--text-muted)' }}>{k}:</span>
+                                      <span className="font-mono text-right" style={{ color: 'var(--text-primary)' }}>{String(v)}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
             </tbody>

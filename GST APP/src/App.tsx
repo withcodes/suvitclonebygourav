@@ -16,6 +16,8 @@ export type ReconciledItem = {
   prAmount: number;
   gstrAmount: number;
   status: string;
+  _prRaw?: any;
+  _gstrRaw?: any;
 };
 
 export type SummaryStats = {
